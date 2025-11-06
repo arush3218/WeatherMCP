@@ -1,61 +1,109 @@
-"""Simple MCP server for weather data."""
-from flask import Flask, request, jsonify
-from weather import get_current_weather, CITY_COORDS
+from __future__ import annotations
+
+import sys
+import json
+import requests
+from typing import Any
 
 
-app = Flask(__name__)
+WEATHER_API = "https://api.open-meteo.com/v1/forecast"
 
 
-@app.route('/')
-def home():
-    """Home endpoint with API info."""
-    return jsonify({
-        "service": "Weather MCP Server",
-        "version": "1.0.0",
-        "endpoints": {
-            "/temperature": "Get temperature for a city (query param: city=bangalore or city=delhi)",
-            "/all": "Get temperatures for all supported cities"
-        },
-        "supported_cities": list(CITY_COORDS.keys())
-    })
+def validate_city(city: str) -> bool:
+    if not city or not isinstance(city, str) or len(city.strip()) == 0:
+        return False
+    return True
 
 
-@app.route('/temperature')
-def get_temperature():
-    """Get temperature for a specific city."""
-    city = request.args.get('city')
+def fetch_coordinates(city: str) -> dict[str, Any]:
+    if not validate_city(city):
+        raise ValueError(f"Invalid city: {city}")
     
-    if not city:
-        return jsonify({
-            "error": "Missing 'city' query parameter",
-            "example": "/temperature?city=bangalore"
-        }), 400
+    geocoding_api = "https://geocoding-api.open-meteo.com/v1/search"
+    params = {
+        "name": city.strip(),
+        "count": 1,
+        "language": "en",
+        "format": "json"
+    }
     
-    result = get_current_weather(city)
+    resp = requests.get(geocoding_api, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
     
-    if "error" in result:
-        return jsonify(result), 404 if "not supported" in result["error"] else 500
+    if not data.get("results"):
+        raise ValueError(f"City '{city}' not found")
     
-    return jsonify(result)
+    result = data["results"][0]
+    return {
+        "latitude": result.get("latitude"),
+        "longitude": result.get("longitude"),
+        "name": result.get("name"),
+        "country": result.get("country"),
+        "timezone": result.get("timezone")
+    }
 
 
-@app.route('/all')
-def get_all_temperatures():
-    """Get temperatures for all supported cities."""
-    results = {}
+def fetch_weather(lat: float, lon: float, timezone: str) -> dict[str, Any]:
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m"
+    }
     
-    for city in CITY_COORDS.keys():
-        weather_data = get_current_weather(city)
-        results[city] = weather_data
-    
-    return jsonify({
-        "cities": results,
-        "count": len(results)
-    })
+    resp = requests.get(WEATHER_API, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    current = data.get("current", {})
+    return {
+        "temperature": current.get("temperature_2m"),
+        "time": current.get("time")
+    }
 
 
-if __name__ == '__main__':
-    print("🌤️  Weather MCP Server starting...")
-    print("📍 Supported cities: Bangalore, Delhi")
-    print("🌐 Server running on http://127.0.0.1:5000")
-    app.run(debug=True, host='127.0.0.1', port=5000)
+def build_response(coords: dict[str, Any], weather: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "city": coords.get("name"),
+        "country": coords.get("country"),
+        "latitude": coords.get("latitude"),
+        "longitude": coords.get("longitude"),
+        "timezone": coords.get("timezone"),
+        "temperature": weather.get("temperature"),
+        "unit": "Celsius",
+        "time": weather.get("time")
+    }
+
+
+def get_weather(city: str) -> dict[str, Any]:
+    try:
+        coords = fetch_coordinates(city)
+        weather = fetch_weather(
+            coords.get("latitude"),
+            coords.get("longitude"),
+            coords.get("timezone")
+        )
+        return build_response(coords, weather)
+    except (ValueError, RuntimeError) as exc:
+        raise RuntimeError(f"Weather lookup failed: {exc}") from exc
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    
+    if not argv:
+        print(json.dumps({"error": "City name required as argument"}), file=sys.stderr)
+        return 1
+    
+    city = " ".join(argv)
+    
+    try:
+        result = get_weather(city)
+        print(json.dumps(result, indent=2))
+        return 0
+    except RuntimeError as exc:
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
